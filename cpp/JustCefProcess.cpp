@@ -564,7 +564,7 @@ std::vector<std::filesystem::path> BuildSearchPaths()
 class JustCefProcessImpl : public WindowCommandTarget, public std::enable_shared_from_this<JustCefProcessImpl>
 {
 public:
-    explicit JustCefProcessImpl(asio::any_io_executor executor) : executor_(std::move(executor)) {}
+    explicit JustCefProcessImpl(asio::any_io_executor executor) : executor_(std::move(executor)), write_strand_(executor_) {}
 
     ~JustCefProcessImpl() { Shutdown(false); }
 
@@ -864,8 +864,7 @@ public:
 
     asio::awaitable<void> NotifyExitAsync()
     {
-        Notify(detail::OpcodeControllerNotification::Exit);
-        co_return;
+        co_await NotifyAsync(detail::OpcodeControllerNotification::Exit);
     }
 
     asio::awaitable<void> StreamOpenAsync(std::uint32_t identifier)
@@ -1360,16 +1359,21 @@ private:
         }
     }
 
-    void SendPacket(detail::PacketType packet_type, std::uint8_t opcode, std::uint32_t request_id, const std::vector<std::uint8_t>& body)
+    asio::awaitable<void> SendPacketAsync(detail::PacketType packet_type, std::uint8_t opcode, std::uint32_t request_id, std::vector<std::uint8_t> body)
     {
         EnsureStarted();
+        auto self = shared_from_this();
+
         if (shutdown_.load())
         {
             throw std::runtime_error("Process transport is shut down.");
         }
+        if (auto err = std::atomic_load(&last_write_error_); err && *err)
+        {
+            std::rethrow_exception(*err);
+        }
 
         const std::uint32_t packet_size = static_cast<std::uint32_t>(body.size() + detail::kPacketHeaderSize - sizeof(std::uint32_t));
-
         std::vector<std::uint8_t> packet(detail::kPacketHeaderSize + body.size());
         std::memcpy(packet.data(), &packet_size, sizeof(packet_size));
         std::memcpy(packet.data() + sizeof(packet_size), &request_id, sizeof(request_id));
@@ -1380,71 +1384,110 @@ private:
             std::memcpy(packet.data() + detail::kPacketHeaderSize, body.data(), body.size());
         }
 
-        std::lock_guard<std::mutex> lock(write_mutex_);
-        WriteExact(packet.data(), packet.size());
+        co_await asio::co_spawn(
+            write_strand_,
+            [self, packet = std::move(packet)]() mutable -> asio::awaitable<void>
+            {
+                if (auto err = std::atomic_load(&self->last_write_error_); err && *err)
+                {
+                    std::rethrow_exception(*err);
+                }
+                if (self->shutdown_.load())
+                {
+                    throw std::runtime_error("Process transport is shut down.");
+                }
+                try
+                {
+                    self->WriteExact(packet.data(), packet.size());
+                }
+                catch (...)
+                {
+                    try
+                    {
+                        auto captured = std::make_shared<std::exception_ptr>(std::current_exception());
+                        std::atomic_store(&self->last_write_error_, captured);
+                    }
+                    catch (...)
+                    {
+                    }
+                    self->Shutdown(false);
+                    throw;
+                }
+                co_return;
+            },
+            asio::use_awaitable);
     }
 
-    void Notify(detail::OpcodeControllerNotification opcode) { SendPacket(detail::PacketType::Notification, static_cast<std::uint8_t>(opcode), 0, {}); }
+    asio::awaitable<void> NotifyAsync(detail::OpcodeControllerNotification opcode)
+    {
+        co_await SendPacketAsync(detail::PacketType::Notification, static_cast<std::uint8_t>(opcode), 0, {});
+    }
 
     asio::awaitable<std::vector<std::uint8_t>> AsyncRawCall(detail::OpcodeController opcode, detail::PacketWriter writer, DeferredOutgoingStreams* deferred = nullptr)
     {
         EnsureStarted();
+        auto self = shared_from_this();
 
-        auto response = co_await asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr, std::vector<std::uint8_t>)>(
-            [self = shared_from_this(), opcode, body = writer.Buffer(), deferred](auto handler) mutable
+        struct ResponseHolder
+        {
+            std::exception_ptr exception;
+            std::vector<std::uint8_t> body;
+            detail::AsyncSignal completed;
+        };
+        auto holder = std::make_shared<ResponseHolder>();
+        const auto request_id = ++self->request_id_counter_;
+
+        {
+            std::lock_guard<std::mutex> lock(self->pending_requests_mutex_);
+            self->pending_requests_[request_id].completion =
+                [holder](std::exception_ptr exception, std::vector<std::uint8_t> response) mutable
             {
-                using Handler = std::decay_t<decltype(handler)>;
+                holder->exception = exception;
+                holder->body = std::move(response);
+                holder->completed.SignalSuccess();
+            };
+        }
 
-                auto handler_ptr = std::make_shared<Handler>(std::move(handler));
-                auto handler_executor = asio::get_associated_executor(*handler_ptr, self->executor_);
-                const auto request_id = ++self->request_id_counter_;
+        auto body = writer.Buffer();
+        try
+        {
+            co_await self->SendPacketAsync(detail::PacketType::Request, static_cast<std::uint8_t>(opcode), request_id, std::move(body));
+            if (deferred && deferred->HasAny())
+            {
+                deferred->StartAll();
+            }
+        }
+        catch (...)
+        {
+            if (deferred)
+            {
+                deferred->CleanupAll();
+            }
+            {
+                std::lock_guard<std::mutex> lock(self->pending_requests_mutex_);
+                self->pending_requests_.erase(request_id);
+            }
+            throw;
+        }
 
-                {
-                    std::lock_guard<std::mutex> lock(self->pending_requests_mutex_);
-                    self->pending_requests_[request_id].completion = [handler_ptr, handler_executor](std::exception_ptr exception, std::vector<std::uint8_t> response) mutable
-                    {
-                        asio::dispatch(handler_executor,
-                                       [handler_ptr, exception, response = std::move(response)]() mutable
-                                       {
-                                           auto completion_handler = std::move(*handler_ptr);
-                                           completion_handler(exception, std::move(response));
-                                       });
-                    };
-                }
+        try
+        {
+            co_await holder->completed.AsyncWait(self->executor_);
+        }
+        catch (...)
+        {
+            {
+                std::lock_guard<std::mutex> lock(self->pending_requests_mutex_);
+                self->pending_requests_.erase(request_id);
+            }
+            throw;
+        }
 
-                try
-                {
-                    self->SendPacket(detail::PacketType::Request, static_cast<std::uint8_t>(opcode), request_id, body);
-
-                    if (deferred && deferred->HasAny())
-                    {
-                        deferred->StartAll();
-                    }
-                }
-                catch (...)
-                {
-                    if (deferred)
-                    {
-                        deferred->CleanupAll();
-                    }
-
-                    {
-                        std::lock_guard<std::mutex> lock(self->pending_requests_mutex_);
-                        self->pending_requests_.erase(request_id);
-                    }
-
-                    auto exception = std::current_exception();
-                    asio::dispatch(handler_executor,
-                                   [handler_ptr, exception]() mutable
-                                   {
-                                       auto completion_handler = std::move(*handler_ptr);
-                                       completion_handler(exception, std::vector<std::uint8_t>{});
-                                   });
-                }
-            },
-            asio::use_awaitable);
-
-        co_return response;
+        if (holder->exception)
+        {
+            std::rethrow_exception(holder->exception);
+        }
+        co_return std::move(holder->body);
     }
 
     asio::awaitable<void> AsyncVoidCall(detail::OpcodeController opcode, detail::PacketWriter writer, DeferredOutgoingStreams* deferred = nullptr)
@@ -1644,18 +1687,30 @@ private:
                                                             break;
                                                         }
 
-                                                        self->SendPacket(detail::PacketType::Response, opcode_byte, request_id, writer.Buffer());
+                                                        asio::co_spawn(
+                                                            self->executor_,
+                                                            [self, opcode_byte, request_id, buf = writer.Buffer()]() mutable -> asio::awaitable<void>
+                                                            {
+                                                                co_await self->SendPacketAsync(detail::PacketType::Response, opcode_byte, request_id, std::move(buf));
+                                                            },
+                                                            asio::detached);
                                                     }
                                                     catch (...)
                                                     {
                                                         Logger::Error("JustCefProcess", "Exception occurred while processing stream IPC request.", std::current_exception());
-                                                        try
-                                                        {
-                                                            self->SendPacket(detail::PacketType::Response, opcode_byte, request_id, {});
-                                                        }
-                                                        catch (...)
-                                                        {
-                                                        }
+                                                        asio::co_spawn(
+                                                            self->executor_,
+                                                            [self, opcode_byte, request_id]() -> asio::awaitable<void>
+                                                            {
+                                                                try
+                                                                {
+                                                                    co_await self->SendPacketAsync(detail::PacketType::Response, opcode_byte, request_id, {});
+                                                                }
+                                                                catch (...)
+                                                                {
+                                                                }
+                                                            },
+                                                            asio::detached);
                                                     }
                                                 });
                         break;
@@ -1774,13 +1829,14 @@ private:
             canceled_incoming_streams_.insert(identifier);
         }
 
+        auto self = shared_from_this();
         asio::co_spawn(
             executor_,
-            [this, identifier]() -> asio::awaitable<void>
+            [self, identifier]() -> asio::awaitable<void>
             {
                 try
                 {
-                    co_await StreamCancelAsync(identifier);
+                    co_await self->StreamCancelAsync(identifier);
                 }
                 catch (...)
                 {
@@ -1978,19 +2034,19 @@ private:
         auto state = std::make_shared<OutgoingStreamState>();
         AddDeferredOutgoingStream(
             writer, deferred, state,
-            [this, bytes](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
+            [self = shared_from_this(), bytes](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
             {
                 std::size_t offset = 0;
                 while (offset < bytes->size() && !state->canceled.load())
                 {
                     const std::size_t chunk_size = std::min<std::size_t>(65536, bytes->size() - offset);
-                    if (co_await StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
+                    if (co_await self->StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
                                                                                               bytes->begin() + static_cast<std::ptrdiff_t>(offset + chunk_size)))
                         != detail::StreamDataStatus::Accepted)
                         co_return;
                     offset += chunk_size;
                 }
-                co_await StreamEndAsync(stream_identifier, offset);
+                co_await self->StreamEndAsync(stream_identifier, offset);
                 co_return;
             });
     }
@@ -2022,19 +2078,19 @@ private:
                 auto state = std::make_shared<OutgoingStreamState>();
                 AddDeferredOutgoingStream(
                     writer, deferred, state,
-                    [this, bytes](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
+                    [self = shared_from_this(), bytes](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
                     {
                         std::size_t offset = 0;
                         while (offset < bytes->size() && !state->canceled.load())
                         {
                             const std::size_t chunk_size = std::min<std::size_t>(65536, bytes->size() - offset);
-                            if (co_await StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
+                            if (co_await self->StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
                                                                                                       bytes->begin() + static_cast<std::ptrdiff_t>(offset + chunk_size)))
                                 != detail::StreamDataStatus::Accepted)
                                 co_return;
                             offset += chunk_size;
                         }
-                        co_await StreamEndAsync(stream_identifier, offset);
+                        co_await self->StreamEndAsync(stream_identifier, offset);
                         co_return;
                     });
                 continue;
@@ -2296,8 +2352,9 @@ private:
 
             try
             {
-                SendPacket(detail::PacketType::Response, static_cast<std::uint8_t>(opcode), request_id, writer.Buffer());
+                co_await SendPacketAsync(detail::PacketType::Response, static_cast<std::uint8_t>(opcode), request_id, writer.Buffer());
                 deferred.StartAll();
+                co_return;
             }
             catch (...)
             {
@@ -2308,13 +2365,13 @@ private:
         catch (...)
         {
             Logger::Error("JustCefProcess", "Exception occurred while processing IPC request.", std::current_exception());
-            try
-            {
-                SendPacket(detail::PacketType::Response, static_cast<std::uint8_t>(opcode), request_id, {});
-            }
-            catch (...)
-            {
-            }
+        }
+        try
+        {
+            co_await SendPacketAsync(detail::PacketType::Response, static_cast<std::uint8_t>(opcode), request_id, {});
+        }
+        catch (...)
+        {
         }
         co_return;
     }
@@ -2423,7 +2480,7 @@ private:
         state->stream = std::move(stream);
         AddDeferredOutgoingStream(
             writer, deferred, state,
-            [this, content_length](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
+            [self = shared_from_this(), content_length](std::uint32_t stream_identifier, std::shared_ptr<OutgoingStreamState> state) -> asio::awaitable<void>
             {
                 std::array<std::uint8_t, 65536> buffer{};
                 std::uint64_t total_read = 0;
@@ -2449,13 +2506,13 @@ private:
                         break;
                     }
 
-                    if (co_await StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(bytes_read)))
+                    if (co_await self->StreamDataAsync(stream_identifier, std::vector<std::uint8_t>(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(bytes_read)))
                         != detail::StreamDataStatus::Accepted)
                         co_return;
 
                     total_read += bytes_read;
                 }
-                co_await StreamEndAsync(stream_identifier, total_read);
+                co_await self->StreamEndAsync(stream_identifier, total_read);
                 co_return;
             });
     }
@@ -2625,10 +2682,15 @@ private:
                 record->shared->is_loading = is_loading;
                 record->shared->can_go_back = can_go_back;
                 record->shared->can_go_forward = can_go_forward;
-                if (!is_loading)
+                if (is_loading)
+                {
+                    record->shared->loading_signal.Reset();
+                }
+                else
                 {
                     record->shared->loading_failed = false;
                     record->shared->loading_error.clear();
+                    record->shared->loading_signal.SignalSuccess();
                 }
                 record->shared->loading_cv.notify_all();
             }
@@ -2680,6 +2742,7 @@ private:
                 record->shared->loading_failed = true;
                 record->shared->loading_error = "Window was closed before loading completed.";
             }
+            record->shared->loading_signal.SignalSuccess();
             record->shared->loading_cv.notify_all();
         }
 
@@ -2733,7 +2796,14 @@ private:
         {
             if (!from_receive_thread && receive_thread_.joinable())
             {
-                receive_thread_.join();
+                if (receive_thread_.get_id() == std::this_thread::get_id())
+                {
+                    receive_thread_.detach();
+                }
+                else
+                {
+                    receive_thread_.join();
+                }
             }
             return;
         }
@@ -2742,7 +2812,14 @@ private:
 
         if (!from_receive_thread && receive_thread_.joinable())
         {
-            receive_thread_.join();
+            if (receive_thread_.get_id() == std::this_thread::get_id())
+            {
+                receive_thread_.detach();
+            }
+            else
+            {
+                receive_thread_.join();
+            }
         }
 
         if (!ready_signal_.IsSignaled())
@@ -2841,7 +2918,8 @@ private:
     std::mutex incoming_streams_mutex_;
     std::unordered_map<std::uint32_t, std::shared_ptr<DataStream>> incoming_streams_;
     std::unordered_set<std::uint32_t> canceled_incoming_streams_;
-    std::mutex write_mutex_;
+    asio::strand<asio::any_io_executor> write_strand_;
+    std::shared_ptr<std::exception_ptr> last_write_error_;
     std::thread receive_thread_;
 
 #ifdef _WIN32

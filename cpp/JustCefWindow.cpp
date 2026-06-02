@@ -414,6 +414,7 @@ asio::awaitable<void> JustCefWindow::LoadUrlAsync(std::string url)
         shared_->is_loading = true;
         shared_->loading_failed = false;
         shared_->loading_error.clear();
+        shared_->loading_signal.Reset();
         shared_->loading_cv.notify_all();
     }
 
@@ -428,6 +429,7 @@ asio::awaitable<void> JustCefWindow::LoadUrlAsync(std::string url)
             shared_->is_loading = false;
             shared_->loading_failed = true;
             shared_->loading_error = "Window navigation failed.";
+            shared_->loading_signal.SignalSuccess();
             shared_->loading_cv.notify_all();
         }
         throw;
@@ -687,7 +689,6 @@ void JustCefWindow::WaitUntilLoaded() const
 
 asio::awaitable<void> JustCefWindow::WaitUntilLoadedAsync() const
 {
-    asio::steady_timer timer(shared_->executor);
     for (;;)
     {
         {
@@ -701,9 +702,7 @@ asio::awaitable<void> JustCefWindow::WaitUntilLoadedAsync() const
                 co_return;
             }
         }
-
-        timer.expires_after(std::chrono::milliseconds(10));
-        co_await timer.async_wait(asio::use_awaitable);
+        co_await shared_->loading_signal.AsyncWait(shared_->executor);
     }
 }
 

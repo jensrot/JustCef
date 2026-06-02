@@ -7,7 +7,6 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -78,6 +77,7 @@ struct WindowShared
     bool can_go_forward = false;
     bool loading_failed = false;
     std::string loading_error;
+    detail::AsyncSignal loading_signal;
 };
 
 } // namespace justcef

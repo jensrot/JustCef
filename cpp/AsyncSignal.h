@@ -2,6 +2,7 @@
 
 #include <asio.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -28,6 +29,13 @@ public:
 
     void SignalFailure(std::exception_ptr exception) { Complete(std::move(exception)); }
 
+    void Reset()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        signaled_ = false;
+        exception_ = nullptr;
+    }
+
     void Wait() const
     {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -51,8 +59,33 @@ public:
 
                 auto handler_ptr = std::make_shared<Handler>(std::move(handler));
                 auto handler_executor = asio::get_associated_executor(*handler_ptr, fallback_executor);
+                auto cancel_slot = asio::get_associated_cancellation_slot(*handler_ptr);
+                auto fired = std::make_shared<std::atomic<bool>>(false);
 
-                std::exception_ptr exception;
+                auto fire = [handler_ptr, handler_executor, fired](std::exception_ptr ex)
+                {
+                    if (fired->exchange(true))
+                    {
+                        return;
+                    }
+                    asio::dispatch(handler_executor,
+                                   [handler_ptr, ex]() mutable
+                                   {
+                                       auto completion_handler = std::move(*handler_ptr);
+                                       completion_handler(ex);
+                                   });
+                };
+
+                if (cancel_slot.is_connected())
+                {
+                    cancel_slot.assign(
+                        [fire](asio::cancellation_type) mutable
+                        {
+                            fire(std::make_exception_ptr(asio::system_error(asio::error::operation_aborted)));
+                        });
+                }
+
+                std::exception_ptr immediate_exception;
                 bool dispatch_immediately = false;
 
                 {
@@ -60,31 +93,17 @@ public:
                     if (signaled_)
                     {
                         dispatch_immediately = true;
-                        exception = exception_;
+                        immediate_exception = exception_;
                     }
                     else
                     {
-                        waiters_.push_back(
-                            [handler_ptr, handler_executor](std::exception_ptr completion_exception) mutable
-                            {
-                                asio::dispatch(handler_executor,
-                                               [handler_ptr, completion_exception]() mutable
-                                               {
-                                                   auto completion_handler = std::move(*handler_ptr);
-                                                   completion_handler(completion_exception);
-                                               });
-                            });
+                        waiters_.push_back(fire);
                     }
                 }
 
                 if (dispatch_immediately)
                 {
-                    asio::dispatch(handler_executor,
-                                   [handler_ptr, exception]() mutable
-                                   {
-                                       auto completion_handler = std::move(*handler_ptr);
-                                       completion_handler(exception);
-                                   });
+                    fire(immediate_exception);
                 }
             },
             asio::use_awaitable);
