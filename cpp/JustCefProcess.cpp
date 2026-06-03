@@ -1368,7 +1368,7 @@ private:
         {
             throw std::runtime_error("Process transport is shut down.");
         }
-        if (auto err = std::atomic_load(&last_write_error_); err && *err)
+        if (auto err = last_write_error_.load(); err && *err)
         {
             std::rethrow_exception(*err);
         }
@@ -1388,7 +1388,7 @@ private:
             write_strand_,
             [self, packet = std::move(packet)]() mutable -> asio::awaitable<void>
             {
-                if (auto err = std::atomic_load(&self->last_write_error_); err && *err)
+                if (auto err = self->last_write_error_.load(); err && *err)
                 {
                     std::rethrow_exception(*err);
                 }
@@ -1405,7 +1405,7 @@ private:
                     try
                     {
                         auto captured = std::make_shared<std::exception_ptr>(std::current_exception());
-                        std::atomic_store(&self->last_write_error_, captured);
+                        self->last_write_error_.store(captured);
                     }
                     catch (...)
                     {
@@ -2919,7 +2919,7 @@ private:
     std::unordered_map<std::uint32_t, std::shared_ptr<DataStream>> incoming_streams_;
     std::unordered_set<std::uint32_t> canceled_incoming_streams_;
     asio::strand<asio::any_io_executor> write_strand_;
-    std::shared_ptr<std::exception_ptr> last_write_error_;
+    std::atomic<std::shared_ptr<std::exception_ptr>> last_write_error_;
     std::thread receive_thread_;
 
 #ifdef _WIN32
