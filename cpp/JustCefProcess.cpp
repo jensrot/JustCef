@@ -1557,7 +1557,7 @@ private:
 
     void ProcessIncomingStreamDispatcher(std::uint32_t identifier, const std::shared_ptr<IncomingStreamDispatcher>& dispatcher)
     {
-        for (;;)
+        while (true)
         {
             std::function<void()> work;
             {
@@ -1593,7 +1593,7 @@ private:
     {
         try
         {
-            for (;;)
+            while (true)
             {
                 std::array<std::uint8_t, detail::kPacketHeaderSize> header_bytes{};
                 const bool had_partial_header = ReadExact(header_bytes.data(), header_bytes.size());
@@ -1871,7 +1871,7 @@ private:
             else
             {
                 std::array<std::uint8_t, 65536> chunk{};
-                for (;;)
+                while (true)
                 {
                     const std::size_t read = stream->Read(chunk.data(), chunk.size());
                     if (read == 0)

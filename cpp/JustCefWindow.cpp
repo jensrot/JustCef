@@ -689,7 +689,7 @@ void JustCefWindow::WaitUntilLoaded() const
 
 asio::awaitable<void> JustCefWindow::WaitUntilLoadedAsync() const
 {
-    for (;;)
+    while (true)
     {
         {
             std::lock_guard<std::mutex> lock(shared_->loading_mutex);

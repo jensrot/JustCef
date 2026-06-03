@@ -16,7 +16,7 @@ void ThreadPool::AddWorkers(size_t count)
         std::thread thread(
             [this]
             {
-                for (;;)
+                while (true)
                 {
                     std::function<void()> task;
 
