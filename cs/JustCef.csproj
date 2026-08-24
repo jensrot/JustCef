@@ -42,7 +42,6 @@
     <JustCefCacheDir>$([System.IO.Path]::Combine('$(JustCefCacheRoot)','$(JustCefVersion)','$(JustCefRid)'))</JustCefCacheDir>
     <JustCefZipPath>$([System.IO.Path]::Combine('$(JustCefCacheDir)','$(JustCefArchiveName)'))</JustCefZipPath>
     <JustCefExtractDir>$([System.IO.Path]::Combine('$(JustCefCacheDir)','extracted'))</JustCefExtractDir>
-
     <JustCefOutputSubdir Condition="$(JustCefRid.StartsWith('osx-'))">justcefnative.app</JustCefOutputSubdir>
     <JustCefOutputSubdir Condition="'$(JustCefOutputSubdir)' == ''">cef</JustCefOutputSubdir>
   </PropertyGroup>
